@@ -1,8 +1,8 @@
 'use client';
-import React, { createContext, useContext, useReducer, useEffect, ReactNode, useRef } from 'react';
+import React, { createContext, useContext, useReducer, useEffect, ReactNode, useRef, useState } from 'react';
 import { useAuth } from './AuthContext';
 import { db } from '@/lib/firebase';
-import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
+import { doc, setDoc, onSnapshot } from 'firebase/firestore';
 
 // ─── Types ────────────────────────────────────────────────
 export type FlowIntensity = 'spotting' | 'light' | 'medium' | 'heavy' | 'none';
@@ -179,18 +179,21 @@ interface AppContextValue {
   getDaysLate: () => number;
   getDayLog: (date: string) => DayLog | undefined;
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
+  isLoaded: boolean;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, defaultState);
-  const { user } = useAuth();
-  const isInitialLoad = useRef(true);
+  const { user, loading: authLoading } = useAuth();
+  const [isLoaded, setIsLoaded] = useState(false);
   const isSyncingFromRemote = useRef(false);
 
   // 1. Initial Load from LocalStorage (for guests) or Firestore (for users)
   useEffect(() => {
+    if (authLoading) return;
+
     if (!user) {
       // Local storage fallback for guests
       const saved = localStorage.getItem('luna_app_state');
@@ -198,61 +201,142 @@ export function AppProvider({ children }: { children: ReactNode }) {
         try {
           const parsed = JSON.parse(saved);
           dispatch({ type: 'LOAD_STATE', payload: { ...defaultState, ...parsed, sidebarOpen: true, toast: null } });
-        } catch { }
+        } catch { /* ignore parse errors */ }
       }
+      setIsLoaded(true);
       return;
     }
 
     // Load from Firestore for authenticated users
-    const userDocRef = doc(db, 'users', user.uid);
+    // Step 1: Immediately load from localStorage for instant display (keyed per user)
+    const userKey = `luna_app_state_${user.uid}`;
 
-    // Set up real-time listener
-    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data() as Partial<AppState>;
-        isSyncingFromRemote.current = true;
+    // Merge both cache sources; prefer whichever has completed onboarding
+    let cachedState: Partial<AppState> | null = null;
+    try {
+      const newRaw = localStorage.getItem(userKey);
+      const oldRaw = localStorage.getItem('luna_app_state');
+      const newParsed = newRaw ? JSON.parse(newRaw) : null;
+      const oldParsed = oldRaw ? JSON.parse(oldRaw) : null;
 
-        // Merge with defaultState to ensure all keys exist
-        const mergedState: AppState = {
-          ...defaultState,
-          ...data,
-          profile: {
-            ...defaultState.profile,
-            ...(data.profile || {})
-          },
-          sidebarOpen: state.sidebarOpen, // Preserve UI state
-          toast: null
-        };
+      // Pick the best source: prefer the one with onboardingComplete=true
+      // Handle both old flat format {onboardingComplete:true} and new {profile:{onboardingComplete:true}}
+      const isOldComplete = oldParsed?.profile?.onboardingComplete || oldParsed?.onboardingComplete;
+      const isNewComplete = newParsed?.profile?.onboardingComplete || newParsed?.onboardingComplete;
 
-        dispatch({ type: 'LOAD_STATE', payload: mergedState });
-        setTimeout(() => { isSyncingFromRemote.current = false; }, 100);
+      if (isOldComplete) {
+        cachedState = oldParsed;
+      } else if (isNewComplete) {
+        cachedState = newParsed;
       } else {
-        // First time user: push current state
-        setDoc(userDocRef, state);
+        cachedState = newParsed || oldParsed;
       }
-    });
+    } catch { /* ignore parse errors */ }
 
-    return () => unsubscribe();
-  }, [user]);
-
-  // 2. Push state changes to Firestore or LocalStorage
-  useEffect(() => {
-    if (typeof window === 'undefined' || isInitialLoad.current || isSyncingFromRemote.current) {
-      isInitialLoad.current = false;
-      return;
+    if (cachedState) {
+      // Normalize: old format had {onboardingComplete:true} flat, new format has {profile:{onboardingComplete:true}}
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const flat = cachedState as any;
+      const normalized: Partial<AppState> = {
+        ...cachedState,
+        profile: {
+          ...defaultState.profile,
+          ...(flat.profile || {}),
+          // Lift flat-level fields into profile for old format compatibility
+          ...(flat.onboardingComplete !== undefined ? { onboardingComplete: flat.onboardingComplete } : {}),
+        },
+      };
+      dispatch({ type: 'LOAD_STATE', payload: { ...defaultState, ...normalized, sidebarOpen: true, toast: null } });
+      setIsLoaded(true); // Show UI immediately from cache
     }
 
+    const userDocRef = doc(db, 'users', user.uid);
+
+    // Safety net: if Firestore takes too long or fails, unblock the UI
+    // (localStorage cache above already handles fast loads for returning users)
+    const timeoutId = setTimeout(() => {
+      console.warn('[Luna] Firestore timeout — unblocking UI');
+      setIsLoaded(true);
+    }, 3000);
+
+    // Set up real-time listener
+    const unsubscribe = onSnapshot(
+      userDocRef,
+      (docSnap) => {
+        clearTimeout(timeoutId);
+        if (docSnap.exists()) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { isLoaded: _ignored, sidebarOpen: _sb, toast: _t, ...data } = docSnap.data() as any;
+          isSyncingFromRemote.current = true;
+
+          const mergedState: AppState = {
+            ...defaultState,
+            ...data,
+            profile: {
+              ...defaultState.profile,
+              ...(data.profile || {})
+            },
+            sidebarOpen: true,
+            toast: null,
+          };
+
+          dispatch({ type: 'LOAD_STATE', payload: mergedState });
+          setIsLoaded(true);
+          setTimeout(() => { isSyncingFromRemote.current = false; }, 100);
+        } else {
+          // No Firestore doc yet — check if there's local data to migrate
+          const saved = localStorage.getItem('luna_app_state');
+          if (saved) {
+            try {
+              const parsed = JSON.parse(saved);
+              const migrateState: AppState = { ...defaultState, ...parsed, sidebarOpen: true, toast: null };
+              dispatch({ type: 'LOAD_STATE', payload: migrateState });
+              // Persist to Firestore (strip non-persistable fields)
+              const { toast: _t, sidebarOpen: _s, ...toSave } = migrateState;
+              setDoc(userDocRef, toSave, { merge: true });
+            } catch {
+              setDoc(userDocRef, defaultState);
+            }
+          } else {
+            setDoc(userDocRef, defaultState);
+          }
+          setIsLoaded(true);
+        }
+      },
+      (error) => {
+        // Firestore error (permissions, network, etc.) — unblock UI
+        clearTimeout(timeoutId);
+        console.error('[Luna] Firestore snapshot error:', error);
+        setIsLoaded(true);
+      }
+    );
+
+    return () => {
+      clearTimeout(timeoutId);
+      unsubscribe();
+    };
+  }, [user, authLoading]);
+
+  // 2. Push state changes to Firestore or LocalStorage
+  //    Guard: only sync AFTER initial load is complete, and never while syncing from remote.
+  useEffect(() => {
+    if (typeof window === 'undefined' || !isLoaded || isSyncingFromRemote.current) return;
+
+    // Only sync meaningful state — never anything that shouldn't persist
     const { toast, sidebarOpen, ...toSave } = state;
 
     if (user) {
-      // Sync to Firestore
+      // Always write to per-user localStorage cache for instant loads on refresh
+      const userKey = `luna_app_state_${user.uid}`;
+      localStorage.setItem(userKey, JSON.stringify(toSave));
+      // Also sync to Firestore in background
       const userDocRef = doc(db, 'users', user.uid);
       setDoc(userDocRef, toSave, { merge: true }).catch(err => console.error("Firestore sync error:", err));
     } else {
       // Sync to LocalStorage for guests
       localStorage.setItem('luna_app_state', JSON.stringify(toSave));
     }
-  }, [state, user]);
+  }, [state, user, isLoaded]);
 
   // Apply theme
   useEffect(() => {
@@ -453,6 +537,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       getDaysLate,
       getDayLog,
       showToast,
+      isLoaded,
     }}>
       {children}
     </AppContext.Provider>

@@ -10,45 +10,46 @@ import MobileNav from './MobileNav';
 
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
-    const { state } = useApp();
+    const { state, isLoaded } = useApp();
     const { user, loading } = useAuth();
     const router = useRouter();
     const pathname = usePathname();
     const [hydrated, setHydrated] = useState(false);
 
-    // Wait for localStorage to hydrate before deciding to redirect
     useEffect(() => {
         setHydrated(true);
     }, []);
 
-    useEffect(() => {
-        if (!hydrated || loading) return;
+    const isAuthPage = pathname?.startsWith('/auth');
+    const isOnboarding = pathname === '/onboarding';
 
-        const isAuthPage = pathname?.startsWith('/auth');
-        const isOnboarding = pathname === '/onboarding';
+    // Determine if we are still loading — cannot make any routing decision yet
+    const isDeciding = !hydrated || loading || !isLoaded;
 
-        // Redirect to login if not authenticated and not on an auth page
+    // Compute target redirect synchronously (null = no redirect needed / still deciding)
+    let targetPath: string | null = null;
+    if (!isDeciding) {
         if (!user && !isAuthPage) {
-            router.replace('/auth/login');
-            return;
-        }
-
-        // Redirect to home if authenticated and on an auth page
-        if (user && isAuthPage) {
-            router.replace('/');
-            return;
-        }
-
-        // Handle onboarding
-        if (user && !state.profile.onboardingComplete && !isOnboarding) {
-            router.replace('/onboarding');
+            targetPath = '/auth/login';
+        } else if (user && isAuthPage) {
+            targetPath = '/';
+        } else if (user && !state.profile.onboardingComplete && !isOnboarding) {
+            targetPath = '/onboarding';
         } else if (user && state.profile.onboardingComplete && isOnboarding) {
-            router.replace('/');
+            targetPath = '/';
         }
-    }, [hydrated, loading, user, state.profile.onboardingComplete, pathname, router]);
+    }
 
-    // Show blank screen while hydrating to avoid flash
-    if (!hydrated) {
+    // Fire the actual navigation
+    useEffect(() => {
+        if (targetPath) {
+            router.replace(targetPath);
+        }
+    }, [targetPath, router]);
+
+    // ── Show spinner while loading OR while a redirect is still pending ──
+    // This prevents any flash of wrong content before the router redirect fires.
+    if (isDeciding || targetPath !== null) {
         return (
             <div style={{
                 minHeight: '100vh',
@@ -68,7 +69,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }
 
     // Public pages — no sidebar/header
-    if (pathname?.startsWith('/auth') || pathname === '/onboarding') {
+    if (isAuthPage || isOnboarding) {
         return (
             <>
                 {children}
@@ -90,4 +91,3 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
     );
 }
-
