@@ -26,6 +26,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     // Determine if we are still loading — cannot make any routing decision yet
     const isDeciding = !hydrated || loading || !isLoaded;
 
+    // Detection: is this a 'suspected' existing user? 
+    // If lastSignInTime is more than 30s after creationTime, they have almost certainly onboarded before.
+    const creation = user?.metadata?.creationTime ? new Date(user.metadata.creationTime).getTime() : 0;
+    const lastSign = user?.metadata?.lastSignInTime ? new Date(user.metadata.lastSignInTime).getTime() : 0;
+    const isSuspectedExisting = user && (lastSign - creation > 30000); // 30s gap
+
     // Compute target redirect synchronously (null = no redirect needed / still deciding)
     let targetPath: string | null = null;
     if (!isDeciding) {
@@ -34,7 +40,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         } else if (user && isAuthPage) {
             targetPath = '/';
         } else if (user && !state.profile.onboardingComplete && !isOnboarding) {
-            targetPath = '/onboarding';
+            // SPECIAL GUARD: If we suspect they are an existing user but we have no onboarding data,
+            // we should NOT redirect to onboarding yet. They might be waiting for a slow sync.
+            // Only redirect to onboarding if it's a new account OR we are 100% sure we've reached Firestore.
+            if (!isSuspectedExisting || (isLoaded && state.profile.name)) {
+                targetPath = '/onboarding';
+            }
         } else if (user && state.profile.onboardingComplete && isOnboarding) {
             targetPath = '/';
         }

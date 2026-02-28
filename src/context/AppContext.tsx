@@ -2,7 +2,7 @@
 import React, { createContext, useContext, useReducer, useEffect, ReactNode, useRef, useState } from 'react';
 import { useAuth } from './AuthContext';
 import { db } from '@/lib/firebase';
-import { doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
 
 // ─── Types ────────────────────────────────────────────────
 export type FlowIntensity = 'spotting' | 'light' | 'medium' | 'heavy' | 'none';
@@ -180,6 +180,7 @@ interface AppContextValue {
   getDayLog: (date: string) => DayLog | undefined;
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
   isLoaded: boolean;
+  loadedFor: string | null; // UID of the user this state belongs to, or 'guest'
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -187,14 +188,17 @@ const AppContext = createContext<AppContextValue | null>(null);
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, defaultState);
   const { user, loading: authLoading } = useAuth();
-  const [isLoaded, setIsLoaded] = useState(false);
+  const [loadedFor, setLoadedFor] = useState<string | null>(null);
   const isSyncingFromRemote = useRef(false);
+  const isLoaded = !!loadedFor; // Helper for compatibility
 
   // 1. Initial Load from LocalStorage (for guests) or Firestore (for users)
   useEffect(() => {
     if (authLoading) return;
 
     if (!user) {
+      if (loadedFor === 'guest') return; // Already guest-loaded
+
       // Local storage fallback for guests
       const saved = localStorage.getItem('luna_app_state');
       if (saved) {
@@ -203,119 +207,162 @@ export function AppProvider({ children }: { children: ReactNode }) {
           dispatch({ type: 'LOAD_STATE', payload: { ...defaultState, ...parsed, sidebarOpen: true, toast: null } });
         } catch { /* ignore parse errors */ }
       }
-      setIsLoaded(true);
+      setLoadedFor('guest');
       return;
     }
 
-    // Load from Firestore for authenticated users
-    // Step 1: Immediately load from localStorage for instant display (keyed per user)
-    const userKey = `luna_app_state_${user.uid}`;
-
-    // Merge both cache sources; prefer whichever has completed onboarding
-    let cachedState: Partial<AppState> | null = null;
-    try {
-      const newRaw = localStorage.getItem(userKey);
-      const oldRaw = localStorage.getItem('luna_app_state');
-      const newParsed = newRaw ? JSON.parse(newRaw) : null;
-      const oldParsed = oldRaw ? JSON.parse(oldRaw) : null;
-
-      // Pick the best source: prefer the one with onboardingComplete=true
-      // Handle both old flat format {onboardingComplete:true} and new {profile:{onboardingComplete:true}}
-      const isOldComplete = oldParsed?.profile?.onboardingComplete || oldParsed?.onboardingComplete;
-      const isNewComplete = newParsed?.profile?.onboardingComplete || newParsed?.onboardingComplete;
-
-      if (isOldComplete) {
-        cachedState = oldParsed;
-      } else if (isNewComplete) {
-        cachedState = newParsed;
-      } else {
-        cachedState = newParsed || oldParsed;
-      }
-    } catch { /* ignore parse errors */ }
-
-    if (cachedState) {
-      // Normalize: old format had {onboardingComplete:true} flat, new format has {profile:{onboardingComplete:true}}
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const flat = cachedState as any;
-      const normalized: Partial<AppState> = {
-        ...cachedState,
-        profile: {
-          ...defaultState.profile,
-          ...(flat.profile || {}),
-          // Lift flat-level fields into profile for old format compatibility
-          ...(flat.onboardingComplete !== undefined ? { onboardingComplete: flat.onboardingComplete } : {}),
-        },
-      };
-      dispatch({ type: 'LOAD_STATE', payload: { ...defaultState, ...normalized, sidebarOpen: true, toast: null } });
-      setIsLoaded(true); // Show UI immediately from cache
+    // ── Authenticated user loading strategy ──────────────────
+    // Reset loading state and clear data from previous (guest) session
+    if (loadedFor !== user.uid) {
+      setLoadedFor(null); // Kill the old 'Ready' flag instantly
+      dispatch({ type: 'LOAD_STATE', payload: defaultState });
     }
 
+    const userKey = `luna_app_state_${user.uid}`;
     const userDocRef = doc(db, 'users', user.uid);
 
-    // Safety net: if Firestore takes too long or fails, unblock the UI
-    // (localStorage cache above already handles fast loads for returning users)
-    const timeoutId = setTimeout(() => {
-      console.warn('[Luna] Firestore timeout — unblocking UI');
-      setIsLoaded(true);
-    }, 3000);
+    // Helper to parse and normalize any saved state (handles old flat format too)
+    const parseAndNormalize = (raw: string): Partial<AppState> | null => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data = JSON.parse(raw) as any;
+        return {
+          ...data,
+          profile: {
+            ...defaultState.profile,
+            ...(data.profile || {}),
+            // Old format: onboardingComplete was at the root level
+            ...(data.onboardingComplete !== undefined ? { onboardingComplete: data.onboardingComplete } : {}),
+          },
+        };
+      } catch { return null; }
+    };
 
-    // Set up real-time listener
+    // Helper: merge Firestore data into state, NEVER downgrading onboardingComplete
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const applyFirestoreData = (rawData: any, protectOnboarding: boolean) => {
+      // Normalization: old Firestore data had fields at root level. 
+      // New format has a nested 'profile' object.
+      const { isLoaded: _il, sidebarOpen: _sb, toast: _t, ...clean } = rawData;
+
+      // Extract profile: prefer nested profile, but fall back to root-level legacy fields
+      const incomingProfile = {
+        ...(clean.profile || {}),
+        // Legacy fallbacks (only used if nested profile doesn't have them)
+        ...(clean.name !== undefined && !clean.profile?.name ? { name: clean.name } : {}),
+        ...(clean.onboardingComplete !== undefined && clean.profile?.onboardingComplete === undefined ? { onboardingComplete: clean.onboardingComplete } : {}),
+        ...(clean.averageCycleLength !== undefined && !clean.profile?.averageCycleLength ? { averageCycleLength: clean.averageCycleLength } : {}),
+      };
+
+      const firestoreOnboarded: boolean = incomingProfile.onboardingComplete === true;
+
+      // DETECTION: even if flag is false, if they have a name, cycles, or logs, 
+      // they have clearly used the app before. We should treat them as onboarded.
+      const hasEvidenceOfUse = Boolean(
+        (incomingProfile.name && incomingProfile.name.trim() !== "") ||
+        (clean.cycles && clean.cycles.length > 0) ||
+        (clean.logs && clean.logs.length > 0)
+      );
+
+      // If we know the user is onboarded (local cache OR evidence) but Firestore says false → it's corrupted data.
+      const finalOnboarded = firestoreOnboarded || protectOnboarding || hasEvidenceOfUse;
+
+      if (!firestoreOnboarded && (protectOnboarding || hasEvidenceOfUse)) {
+        console.warn('[Luna] Detected onboarded user with missing completion flag — repairing...');
+        // Repair: write the correct value back to Firestore in the NEW format
+        setDoc(userDocRef, { profile: { ...incomingProfile, onboardingComplete: true } }, { merge: true })
+          .catch(e => console.warn('[Luna] Firestore repair failed:', e.message));
+      }
+
+      const mergedState: AppState = {
+        ...defaultState,
+        ...clean,
+        profile: {
+          ...defaultState.profile,
+          ...incomingProfile,
+          onboardingComplete: finalOnboarded,
+        },
+        sidebarOpen: true,
+        toast: null,
+      };
+      isSyncingFromRemote.current = true;
+      dispatch({ type: 'LOAD_STATE', payload: mergedState });
+      setLoadedFor(user.uid);
+      setTimeout(() => { isSyncingFromRemote.current = false; }, 100);
+    };
+
+    // Step 1: Instantly load from per-user localStorage cache (on same device)
+    const newRaw = localStorage.getItem(userKey);
+    const oldRaw = localStorage.getItem('luna_app_state');
+    const newParsed = newRaw ? parseAndNormalize(newRaw) : null;
+    const oldParsed = oldRaw ? parseAndNormalize(oldRaw) : null;
+
+    // Prefer whichever local source has onboardingComplete=true
+    const bestLocal =
+      (oldParsed?.profile as any)?.onboardingComplete ? oldParsed :
+        (newParsed?.profile as any)?.onboardingComplete ? newParsed :
+          newParsed || oldParsed;
+
+    if (bestLocal) {
+      dispatch({ type: 'LOAD_STATE', payload: { ...defaultState, ...bestLocal, sidebarOpen: true, toast: null } });
+      setLoadedFor(user.uid); // Unblock UI instantly from cache
+    }
+
+    // Whether local data definitively says this user is onboarded
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const localSaysOnboarded = (bestLocal?.profile as any)?.onboardingComplete === true;
+
+    // Step 2: getDoc — simple HTTP fetch, works even when onSnapshot (WebSocket) fails.
+    // This is the primary source of truth for new/different devices.
+    getDoc(userDocRef)
+      .then((docSnap) => {
+        if (docSnap.exists()) {
+          // Pass localSaysOnboarded so corrupted Firestore data can never override local truth
+          applyFirestoreData(docSnap.data(), localSaysOnboarded);
+          // Update local cache — preserve the corrected onboardingComplete
+          const { toast: _t, sidebarOpen: _s, isLoaded: _il, ...toCache } = docSnap.data() as any;
+          const corrected = {
+            ...toCache,
+            profile: {
+              ...defaultState.profile,
+              ...(toCache.profile || {}),
+              onboardingComplete: (toCache.profile?.onboardingComplete === true) || localSaysOnboarded,
+            },
+          };
+          localStorage.setItem(userKey, JSON.stringify(corrected));
+        } else if (!bestLocal) {
+          // Brand new user, no doc and no local cache
+          setLoadedFor(user.uid);
+        }
+      })
+      .catch((err) => {
+        console.warn('[Luna] getDoc failed:', err.message);
+        if (!bestLocal) setLoadedFor(user.uid);
+      });
+
+    // Step 3: onSnapshot — real-time updates only (skip first event, handled by getDoc)
+    let snapshotSkipFirst = true;
     const unsubscribe = onSnapshot(
       userDocRef,
       (docSnap) => {
-        clearTimeout(timeoutId);
-        if (docSnap.exists()) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const { isLoaded: _ignored, sidebarOpen: _sb, toast: _t, ...data } = docSnap.data() as any;
-          isSyncingFromRemote.current = true;
-
-          const mergedState: AppState = {
-            ...defaultState,
-            ...data,
-            profile: {
-              ...defaultState.profile,
-              ...(data.profile || {})
-            },
-            sidebarOpen: true,
-            toast: null,
-          };
-
-          dispatch({ type: 'LOAD_STATE', payload: mergedState });
-          setIsLoaded(true);
-          setTimeout(() => { isSyncingFromRemote.current = false; }, 100);
-        } else {
-          // No Firestore doc yet — check if there's local data to migrate
-          const saved = localStorage.getItem('luna_app_state');
-          if (saved) {
-            try {
-              const parsed = JSON.parse(saved);
-              const migrateState: AppState = { ...defaultState, ...parsed, sidebarOpen: true, toast: null };
-              dispatch({ type: 'LOAD_STATE', payload: migrateState });
-              // Persist to Firestore (strip non-persistable fields)
-              const { toast: _t, sidebarOpen: _s, ...toSave } = migrateState;
-              setDoc(userDocRef, toSave, { merge: true });
-            } catch {
-              setDoc(userDocRef, defaultState);
-            }
-          } else {
-            setDoc(userDocRef, defaultState);
-          }
-          setIsLoaded(true);
-        }
+        if (snapshotSkipFirst) { snapshotSkipFirst = false; return; }
+        if (docSnap.exists()) applyFirestoreData(docSnap.data(), localSaysOnboarded);
       },
-      (error) => {
-        // Firestore error (permissions, network, etc.) — unblock UI
-        clearTimeout(timeoutId);
-        console.error('[Luna] Firestore snapshot error:', error);
-        setIsLoaded(true);
-      }
+      (err) => { console.warn('[Luna] onSnapshot (non-critical):', err.message); }
     );
+
+    // Step 4: Safety timeout
+    const waitTime = bestLocal ? 8000 : 15000;
+    const timeoutId = setTimeout(() => {
+      console.warn(`[Luna] Firestore timed out — unblocking UI for ${user.uid}`);
+      setLoadedFor(user.uid);
+    }, waitTime);
 
     return () => {
       clearTimeout(timeoutId);
       unsubscribe();
     };
-  }, [user, authLoading]);
+  }, [user, authLoading, loadedFor]); // Added loadedFor to trigger reset if identity drifts
 
   // 2. Push state changes to Firestore or LocalStorage
   //    Guard: only sync AFTER initial load is complete, and never while syncing from remote.
@@ -538,6 +585,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       getDayLog,
       showToast,
       isLoaded,
+      loadedFor,
     }}>
       {children}
     </AppContext.Provider>

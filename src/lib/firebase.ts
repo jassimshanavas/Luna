@@ -16,6 +16,9 @@ const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = initializeFirestore(app, {
     ignoreUndefinedProperties: true,
+    // Using simple fetch-based transport which is more resilient to network blocks
+    // than the default WebChannel/WebSocket transport which often triggers net::ERR_ABORTED.
+    experimentalForceLongPolling: true,
 });
 
 export { auth, db };

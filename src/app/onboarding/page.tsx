@@ -2,6 +2,9 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useApp } from '@/context/AppContext';
+import { useAuth } from '@/context/AuthContext';
+import { db } from '@/lib/firebase';
+import { doc, setDoc } from 'firebase/firestore';
 
 // ─── Step Definitions ─────────────────────────────────────────────────────────
 const TOTAL_STEPS = 7;
@@ -32,6 +35,7 @@ const SYMPTOMS_PREVIEW = ['Cramps', 'Bloating', 'Headaches', 'Mood swings', 'Bac
 // ─── Main Component ────────────────────────────────────────────────────────────
 export default function OnboardingPage() {
     const { dispatch, startPeriod } = useApp();
+    const { user } = useAuth();
     const router = useRouter();
 
     const [step, setStep] = useState(0); // 0 = welcome splash
@@ -119,6 +123,41 @@ export default function OnboardingPage() {
         }
 
         dispatch({ type: 'COMPLETE_ONBOARDING' });
+
+        // Directly write to Firestore immediately — don't rely on the background sync effect.
+        // This guarantees cross-device availability even if Firestore had prior connection issues.
+        if (user) {
+            const profileData = {
+                name: name.trim(),
+                pronouns: pronouns.trim() || undefined,
+                age: age ? parseInt(age) : undefined,
+                trackingGoal: goal,
+                averageCycleLength: cycleLen,
+                averagePeriodLength: periodLen,
+                birthControlMethod: birthControl === 'none' ? undefined : birthControl,
+                lastPeriodStart: unsure ? undefined : lastPeriod || undefined,
+                notifications,
+                onboardingComplete: true, // ← the critical flag
+                theme: 'light',
+                reminderDays: 3,
+                aiModel: 'gemini-flash-latest',
+            } as const;
+
+            const userDocRef = doc(db, 'users', user.uid);
+            setDoc(userDocRef, { profile: profileData }, { merge: true })
+                .then(() => console.log('[Luna] Onboarding saved to Firestore ✓'))
+                .catch(err => {
+                    console.error('[Luna] Firestore onboarding save failed:', err);
+                    // Fallback: save to per-user localStorage so same device works
+                    const key = `luna_app_state_${user.uid}`;
+                    const existing = localStorage.getItem(key);
+                    const parsed = existing ? JSON.parse(existing) : {};
+                    localStorage.setItem(key, JSON.stringify({
+                        ...parsed,
+                        profile: { ...parsed.profile, ...profileData },
+                    }));
+                });
+        }
 
         // Animated transition
         setTimeout(() => router.replace('/'), 400);
